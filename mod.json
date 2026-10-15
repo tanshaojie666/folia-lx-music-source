@@ -2,7 +2,7 @@
   "folium": 1,
   "id": "lx-music-source",
   "name": "洛雪音源",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "author": "local",
   "description": "多音源接入：内置无损直连后端（网易云/酷我/咪咕/QQ/酷狗）+ 洛雪音乐自定义脚本。每个音源可单独启用/停用，也可随时添加新音源（本地 .js 或 URL）。无损优先取链，失败自动降级并跨平台回退。",
   "main": "main.cjs",
