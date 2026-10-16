@@ -442,6 +442,43 @@ function aggIdOf(u) {
   return m ? decodeURIComponent(m[1]) : '';
 }
 
+/* ── 网易云官方搜索（直连，不经聚合站）──────────────────────────────
+ * 2026-10-16 实测：聚合站的 server=netease 搜索分支返回空数组（2 字节 "[]"），
+ * 而官方 cloudsearch 正常，还带回 hr/sq 规格字段。
+ * 取链仍走聚合站 br=740 —— 官方搜索给的 id 交给聚合站，实测 12/12 全拿到真 FLAC，
+ * 包括周杰伦的版权曲（原唱 id 一样能取，不再只能拿翻唱）。
+ *
+ * 这条是「网易云（聚合）」的主搜索路。它挂了才落到聚合站，聚合站也空才落到 migu。
+ * ─────────────────────────────────────────────────────────────────── */
+async function neteaseOfficialSearch(http, q, limit) {
+  const n = Math.min(Math.max(limit || 10, 1), 30);
+  const url = 'https://music.163.com/api/cloudsearch/pc?s=' + encodeURIComponent(q) +
+    '&type=1&limit=' + n + '&offset=0';
+  const j = await http.getJson(url, { headers: { Referer: 'https://music.163.com/' } });
+  const songs = j && j.result && j.result.songs;
+  if (!Array.isArray(songs)) return [];
+
+  const out = [];
+  const seen = {};
+  for (const s of songs) {
+    const sid = s && s.id != null ? String(s.id) : '';
+    if (!sid || seen[sid]) continue;
+    seen[sid] = 1;
+    const ar = Array.isArray(s.ar) ? s.ar : (Array.isArray(s.artists) ? s.artists : []);
+    const al = s.al || s.album || {};
+    out.push({
+      id: sid,
+      title: s.name || '',
+      artist: ar.map(function (a) { return (a && a.name) || ''; }).filter(Boolean).join('/'),
+      album: al.name || '',
+      cover: al.picUrl || '',
+      durationMs: s.dt || s.duration || 0,
+      _urlServer: 'netease',
+    });
+  }
+  return out;
+}
+
 function buildDirectBackends(http) {
   /* ---- 聚合后端：搜索 + 无损取链，全平台走同一口子 ---- */
   /* 搜索用哪些 server、取链走哪个 server 是两件事：
@@ -453,7 +490,8 @@ function buildDirectBackends(http) {
    *   kugou   返回的是 32 位 hash，跟数字 id 不通用，取链必须走 kugou；
    *           但实测 kugou 取链几乎全是空响应，只能当极低优先兜底。
    */
-  function makeAgg(id, name, short, searchServers, urlServer) {
+  function makeAgg(id, name, short, searchServers, urlServer, opts) {
+    const officialFirst = !!(opts && opts.officialSearch);
     return {
       id: id,
       name: name,
@@ -464,7 +502,25 @@ function buildDirectBackends(http) {
         const seen = {};
         const out = [];
 
+        const push = function (o) {
+          const key = o.title + '\u0000' + o.artist;
+          if (seen[key]) return;
+          seen[key] = 1;
+          out.push(o);
+        };
+
+        /* 路 0：网易云官方搜索。聚合站的 netease 搜索分支返空时，这是唯一能搜到的路。 */
+        if (officialFirst) {
+          try {
+            const rows = await neteaseOfficialSearch(http, q, Math.max(10, limit));
+            for (const r of rows) push(r);
+          } catch {
+            /* 落到聚合站 */
+          }
+        }
+
         for (const server of searchServers) {
+          if (out.length >= limit) break;
           let j = null;
           try {
             j = await http.getJson(aggSearchUrl(q, server), {
@@ -478,10 +534,7 @@ function buildDirectBackends(http) {
           for (const it of j) {
             const sid = aggIdOf(it.url);
             if (!sid) continue;
-            const key = it.name + '\u0000' + it.artist;
-            if (seen[key]) continue;
-            seen[key] = 1;
-            out.push({
+            push({
               id: sid,
               title: it.name || '',
               artist: it.artist || '',
@@ -491,7 +544,6 @@ function buildDirectBackends(http) {
               _urlServer: server === 'kugou' ? 'kugou' : urlServer,
             });
           }
-          if (out.length >= limit) break;
         }
 
         return out.slice(offset, offset + limit);
@@ -550,7 +602,9 @@ function buildDirectBackends(http) {
     };
   }
 
-  const wy = makeAgg('wy', '网易云（聚合）', '网', ['netease'], 'netease');
+  /* wy 的搜索三级兜底：官方直连 → 聚合 netease → 聚合 migu（migu 返回的就是网易云 id，
+   * 所以取链仍走 netease）。2026-10-16 起聚合 netease 搜索返空，官方直连顶上主路。 */
+  const wy = makeAgg('wy', '网易云（聚合）', '网', ['netease', 'migu'], 'netease', { officialSearch: true });
   const migu = makeAgg('migu', '咪咕（聚合）', '咪', ['migu', 'netease'], 'netease');
   const kugou = makeAgg('kugou', '酷狗（聚合）', '酷', ['kugou'], 'kugou');
 
@@ -907,8 +961,35 @@ class SourceRegistry {
 
   /* ---- 扫描脚本 ---- */
 
+  /*
+   * 音源目录必须放在模组目录**之外**。
+   *
+   * 原因：宿主把「启用本模组」的授权绑定到模组目录整棵树的哈希
+   * （electron/modSystem/modDigest.cjs 的 computeModDigest 会遍历每个文件，
+   * 路径与内容都进哈希）。音源文件一旦落在模组目录内，用户每添加或删除一个音源，
+   * 模组哈希就变化，宿主的 resolveTrust 会当场判定 trustStale 并把模组停用 ——
+   * 表现为「加一个音源，整个模组失效，要重新点一次『仍要启用』」。
+   *
+   * 放到 userData 下同时解决两件事：躲开哈希，以及不把有版权的音源混进发布包。
+   *
+   * __dirname = <userData>/mods/<modId>，所以上跳两级就是 <userData>。
+   */
   sourcesDir() {
-    return path.join(__dirname, 'sources');
+    if (this._sourcesDir) return this._sourcesDir;
+
+    let external = null;
+    try {
+      external = path.join(path.dirname(path.dirname(__dirname)), 'lx-music-sources');
+      fs.mkdirSync(external, { recursive: true });
+      fs.accessSync(external, fs.constants.W_OK);
+    } catch {
+      // 只读环境（例如模组被放进 resources/mods/）回退到模组内目录，
+      // 此时用户仍能读已有音源，只是新增会失败并给出明确报错。
+      external = path.join(__dirname, 'sources');
+    }
+
+    this._sourcesDir = external;
+    return external;
   }
 
   ensureDir() {
@@ -916,6 +997,47 @@ class SourceRegistry {
       fs.mkdirSync(this.sourcesDir(), { recursive: true });
     } catch {
       /* 已存在 */
+    }
+    this.migrateLegacySources();
+  }
+
+  /*
+   * 老版本把音源放在模组目录内的 sources/。那个位置会污染模组哈希，
+   * 所以首次运行时搬一次家，并清掉模组内的旧目录（连同 .gitkeep 之类）。
+   * 只搬 .js，且目标已存在同名文件时不覆盖。
+   */
+  migrateLegacySources() {
+    if (this._migrated) return;
+    this._migrated = true;
+
+    const legacy = path.join(__dirname, 'sources');
+    const target = this.sourcesDir();
+    if (path.resolve(legacy) === path.resolve(target)) return;
+
+    let moved = 0;
+    try {
+      if (fs.existsSync(legacy)) {
+        for (const f of fs.readdirSync(legacy)) {
+          if (!f.toLowerCase().endsWith('.js')) continue;
+          const src = path.join(legacy, f);
+          const dst = path.join(target, f);
+          if (fs.existsSync(dst)) continue;
+          try {
+            fs.copyFileSync(src, dst);
+            moved++;
+          } catch (err) {
+            this.api.log.warn('迁移音源失败 ' + f, String(err));
+          }
+        }
+        // 整个旧目录都要消失：留在模组树里会继续参与哈希。
+        fs.rmSync(legacy, { recursive: true, force: true });
+      }
+    } catch (err) {
+      this.api.log.warn('清理模组内旧 sources/ 失败', String(err));
+    }
+
+    if (moved) {
+      this.api.log.info('已把 ' + moved + ' 个音源迁到 ' + target + '（原位置会破坏模组信任）');
     }
   }
 
