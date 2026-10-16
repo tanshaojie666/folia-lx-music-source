@@ -215,27 +215,76 @@ export default function activate(folium) {
 
   // 把设置区里的值同步给 main（宿主没暴露变更订阅，用低频轮询）
   let lastPushed = '';
-  async function pushSettings() {
-    if (!settingsAccess?.get) return;
-    let values;
+  let lastPort = 0;
+
+  /* 解灰端口：Folia 主进程里的网易云后端起在动态端口上，只有渲染层
+   * （此处）能通过 window.electron.getNeteasePort() 问到。主进程拿到它之后，
+   * 就能用 /song/url/v1?...&unblock=true 解析版权原唱（实测「晴天」269.75s 完整版）。
+   * 端口在 Folia 重启后会变，所以每次轮询都比对一次。 */
+  async function readUnblockPort() {
     try {
-      values = settingsAccess.get();
+      const p = await window.electron?.getNeteasePort?.();
+      const n = Number(p);
+      return Number.isInteger(n) && n > 0 && n < 65536 ? n : 0;
     } catch {
-      return;
+      return 0;
     }
-    if (!values) return;
-    const key = JSON.stringify(values);
+  }
+
+  /* 诊断：确认本模块能看到的全局对象（模组跑在隔离上下文里，
+   * window.electron 未必可见，这决定端口从哪来）。 */
+  try {
+    log.info(
+      '上下文自检：electron=' + typeof window.electron +
+        ' folium=' + typeof window.folium +
+        ' getPort=' + typeof window.electron?.getNeteasePort +
+        ' hostKeys=' + Object.keys(folium.host || {}).join(',')
+    );
+  } catch (e) {
+    log.warn('上下文自检失败', String(e?.message ?? e));
+  }
+
+  async function pushSettings() {
+    /* 端口与设置区是**独立**的两件事：设置区注册失败时（宿主版本差异、
+     * sections 不可用等）也必须把解灰端口送进主进程，否则版权原唱会静默
+     * 退回翻唱。所以先无条件上报端口，再处理设置值。 */
+    const port = await readUnblockPort();
+
+    let values = null;
+    try {
+      values = settingsAccess?.get ? settingsAccess.get() : null;
+    } catch {
+      values = null;
+    }
+
+    const payload = {
+      quality: values?.quality,
+      fallback: values?.fallback,
+      enabledSources: values?.enabledSources,
+      unblockPort: port,
+    };
+    const key = JSON.stringify(payload);
     if (key === lastPushed) return;
     lastPushed = key;
+
     try {
-      await rpc('config.sync', {
-        quality: values.quality,
-        fallback: values.fallback,
-        enabledSources: values.enabledSources,
-      });
-      await mountAll(true);
+      await rpc('config.sync', payload);
+      if (port && port !== lastPort) {
+        lastPort = port;
+        log.info(`网易云解灰端口 ${port} 已交给音源后端`);
+      }
     } catch (err) {
       log.warn('同步音源设置失败', String(err));
+      lastPushed = ''; // 失败就允许下一轮重试
+      return;
+    }
+
+    if (values) {
+      try {
+        await mountAll(true);
+      } catch (err) {
+        log.warn('挂载音源失败', String(err));
+      }
     }
   }
 
@@ -390,6 +439,9 @@ export default function activate(folium) {
   registerCommands();
 
   mountAll(true).catch((err) => log.error('挂载音源失败', String(err)));
+
+  // 立刻上报一次：解灰端口不能等 4 秒轮询，否则首次播放会退回翻唱。
+  pushSettings().catch(() => {});
 
   const timer = setInterval(() => {
     pushSettings().catch(() => {});

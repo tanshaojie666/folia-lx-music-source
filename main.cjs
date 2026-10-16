@@ -17,6 +17,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const net = require('node:net');
 const vm = require('node:vm');
 const zlib = require('node:zlib');
 const crypto = require('node:crypto');
@@ -479,6 +480,231 @@ async function neteaseOfficialSearch(http, q, limit) {
   return out;
 }
 
+/* ── 原唱优先（版权曲目降权绕过）────────────────────────────────────
+ * 2026-10-16 实测：网易云对周杰伦这类版权曲目做的是**降权**，不是删除。
+ *   cloudsearch「晴天 周杰伦」limit=10  —— 186016（原唱 269s）完全不出现；
+ *   limit=100                          —— 出现了，但 dt=0（被标记不可播），排在最后。
+ * 而 /api/v1/artist/songs 这条路**不降权**：
+ *   id=6452（周杰伦）→ 含 186016 晴天 / 269s / 《叶惠美》，字段完整。
+ * 所以：从查询里认出歌手 → 拉该歌手全量歌曲 → 标题命中的提到最前。
+ * 实测把原唱从「搜不到」变成第 1 条。
+ * ─────────────────────────────────────────────────────────────────── */
+async function neteaseArtistOriginals(http, q, limit) {
+  const tokens = String(q || '').split(/\s+/).map(function (x) { return x.trim(); }).filter(Boolean);
+  if (tokens.length < 2) return [];
+
+  let list = [];
+  try {
+    const artists = await http.getJson(
+      'https://music.163.com/api/cloudsearch/pc?s=' + encodeURIComponent(tokens.join(' ')) +
+        '&type=100&limit=5&offset=0',
+      { headers: { Referer: 'https://music.163.com/' } }
+    );
+    list = (artists && artists.result && artists.result.artists) || [];
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(list) || !list.length) return [];
+
+  /* 歌手名必须**原样**出现在查询里，否则「晴天」会被误当歌手名。 */
+  const hit = list.find(function (a) {
+    const nm = String((a && a.name) || '').trim();
+    return nm && tokens.indexOf(nm) >= 0;
+  });
+  if (!hit) return [];
+
+  const rest = tokens.filter(function (t) { return t !== String(hit.name).trim(); });
+  if (!rest.length) return [];
+
+  let songs = [];
+  try {
+    const res = await http.getJson(
+      'https://music.163.com/api/v1/artist/songs?id=' + encodeURIComponent(hit.id) + '&limit=100&offset=0',
+      { headers: { Referer: 'https://music.163.com/' } }
+    );
+    songs = (res && res.songs) || [];
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(songs)) return [];
+
+  const cap = Math.min(Math.max(limit || 10, 1), 10);
+  const out = [];
+  for (const s of songs) {
+    const sid = s && s.id != null ? String(s.id) : '';
+    const title = String((s && s.name) || '');
+    if (!sid || !title) continue;
+    /* 标题必须命中查询里的剩余词，避免把该歌手全部歌曲塞进结果。 */
+    if (!rest.some(function (t) { return title.indexOf(t) >= 0; })) continue;
+    const ar = Array.isArray(s.ar) ? s.ar : (Array.isArray(s.artists) ? s.artists : []);
+    const al = s.al || s.album || {};
+    out.push({
+      id: sid,
+      title: title,
+      artist: ar.map(function (a) { return (a && a.name) || ''; }).filter(Boolean).join('/'),
+      album: al.name || '',
+      cover: al.picUrl || '',
+      durationMs: s.dt || s.duration || 0,
+      _urlServer: 'netease',
+      _original: true,
+    });
+    if (out.length >= cap) break;
+  }
+  return out;
+}
+
+/* ── 网易云解灰（Folia 自带后端）────────────────────────────────────
+ * Folia 主进程内置 @unblockneteasemusic/server，起在 127.0.0.1:<动态端口>，
+ * 对版权曲目能拿到**完整原唱**：
+ *   GET /song/url/v1?id=186016&level=lossless&unblock=true
+ *     → http://bd-er.kuwo.cn/...  （实测 Folia 播放器读出的时长 = 269.75s，
+ *        即《叶惠美》原唱完整版；搜索结果里那首翻唱只有 112s）
+ * 端口是动态的，所以由**渲染层**（能调 window.electron.getNeteasePort）
+ * 通过 config.sync 把端口交进来，主进程只负责拼 URL 与探测。
+ * 拿不到端口时整条路自动跳过，不影响其它后端。
+ * ─────────────────────────────────────────────────────────────────── */
+let neteaseUnblockPort = 0;
+const UNBLOCK_LEVELS = ['lossless', 'hires'];
+
+function unblockUrl(id, level) {
+  return 'http://127.0.0.1:' + neteaseUnblockPort +
+    '/song/url/v1?id=' + encodeURIComponent(id) + '&level=' + level + '&unblock=true';
+}
+
+/* 自己找解灰后端端口。
+ * 为什么不靠渲染层上报：模组 client 跑在 Electron 的**隔离上下文**里
+ * （实测 window.electron === undefined），拿不到 getNeteasePort()。
+ *
+ * 端口范围：Folia 用 findFreePort() = net.createServer().listen(0) 取端口，
+ * 即**操作系统临时端口段**，不是固定区间。实测同一个 Windows 上，
+ * 早先落在 149xx（所以早期版本误以为可以只扫 14900–14999），
+ * 后来系统单调推进到 32xx —— 那次硬编码扫描的命中率是 **0/100**。
+ * 所以不能猜固定窗口，必须覆盖整段：
+ *   Windows      1024–15000  （netsh 实测动态端口范围）
+ *   Linux/macOS  32768–60999 （IANA ephemeral）
+ * 两段实测合计约 6.6s（TCP 先行，再只对开放端口做 HTTP 识别）。
+ *
+ * 命中判定：/song/url/v1 返回带 data 数组的 JSON。探测结果缓存，
+ * 失败则指数退避重试（1s → 2s → … 上限 60s），避免空转烧 CPU。 */
+let portProbeAt = 0;
+let portProbeFailures = 0;
+let portProbeInFlight = null;
+
+/* 按平台给范围，别在 Windows 上白扫 4 秒 Linux 段（反之亦然）。 */
+const EPHEMERAL_RANGES = process.platform === 'win32'
+  ? [[1024, 15000]]              // netsh int ipv4 show dynamicport tcp
+  : [[32768, 60999], [1024, 15000]];  // IANA ephemeral；部分容器/旧内核仍用低位段
+
+/* TCP 先探连通性：比直接发 HTTP 快得多，也不给无关端口留半开连接。 */
+function tcpOpen(port, timeoutMs) {
+  return new Promise(function (resolve) {
+    const sock = new net.Socket();
+    let settled = false;
+    const finish = function (ok) {
+      if (settled) return;
+      settled = true;
+      try { sock.destroy(); } catch { /* 忽略 */ }
+      resolve(ok);
+    };
+    sock.setTimeout(timeoutMs);
+    sock.once('connect', function () { finish(true); });
+    sock.once('timeout', function () { finish(false); });
+    sock.once('error', function () { finish(false); });
+    sock.connect(port, '127.0.0.1');
+  });
+}
+
+async function discoverUnblockPort(http, force) {
+  if (neteaseUnblockPort) return neteaseUnblockPort;
+
+  /* 启动路径与 unblock.status 可能同时触发。全段扫描要几秒，
+   * 两个并发扫会互相抢连接、双双超时（实测 2.4s → 17.5s 且失败），
+   * 所以共用同一个在飞的 promise。 */
+  if (portProbeInFlight) return portProbeInFlight;
+
+  const now = Date.now();
+  // 失败越多等得越久（1s → 2s → 4s … 上限 60s），避免空转烧 CPU。
+  const backoff = Math.min(1000 * Math.pow(2, portProbeFailures), 60000);
+  if (!force && now - portProbeAt < backoff) return 0;
+  portProbeAt = now;
+
+  portProbeInFlight = (async function () {
+    /* 只对 TCP 连得上的端口发 HTTP：开放端口通常只有几十个，
+     * 逐个发 HTTP 也远快于对整段发。
+     *
+     * 识别请求**不带 unblock=true**：带了会触发上游解灰，
+     * 冷启动实测 11s（同请求热了只要 2ms），会把扫描拖到超时；
+     * 不带的实测 181–218ms，且照样能唯一区分 ——
+     * 真后端返回 code=200 + data 数组，其它开放端口是 404/401。 */
+    const identify = async function (port) {
+      try {
+        const r = await http.httpGet(
+          'http://127.0.0.1:' + port + '/song/url/v1?id=186016&level=standard',
+          { timeout: 3000 }
+        );
+        if (r.status !== 200 || !r.buf.length) return false;
+        const j = JSON.parse(r.buf.toString('utf8'));
+        return !!(j && j.code === 200 && Array.isArray(j.data));
+      } catch {
+        return false;
+      }
+    };
+
+    const TCP_TIMEOUT = 250;
+    const BATCH = 400;
+
+    for (const [from, to] of EPHEMERAL_RANGES) {
+      const ports = [];
+      for (let p = from; p <= to; p++) ports.push(p);
+
+      for (let i = 0; i < ports.length; i += BATCH) {
+        const slice = ports.slice(i, i + BATCH);
+        const tcp = await Promise.all(slice.map(function (p) { return tcpOpen(p, TCP_TIMEOUT); }));
+        const open = slice.filter(function (_, k) { return tcp[k]; });
+        if (!open.length) continue;
+
+        const isUnblock = await Promise.all(open.map(identify));
+        const found = open.filter(function (_, k) { return isUnblock[k]; });
+        if (found.length) {
+          neteaseUnblockPort = found[0];
+          portProbeFailures = 0;
+          urlCache.clear();
+          return neteaseUnblockPort;
+        }
+      }
+    }
+
+    portProbeFailures++;
+    return 0;
+  })();
+
+  try {
+    return await portProbeInFlight;
+  } finally {
+    portProbeInFlight = null;
+  }
+}
+
+/* 问解灰后端要一个可用 URL；返回 { url, kind } 或 null。
+ * 超时必须给足：解灰链是「本地后端 → 上游解灰源 → 第三方 CDN」三段，
+ * 实测 6s 会偶发 abort（同一个 URL 手测 0.9s 就回），放宽到 12s。 */
+async function neteaseUnblockResolve(http, id) {
+  if (!neteaseUnblockPort) return null;
+  for (const level of UNBLOCK_LEVELS) {
+    let j = null;
+    try {
+      j = await http.getJson(unblockUrl(id, level), { timeout: 12000 });
+    } catch {
+      continue;
+    }
+    const d = (j && j.data && j.data[0]) || null;
+    const url = d && d.url;
+    if (!url || !/^https?:/i.test(url)) continue;
+    return { url: String(url), kind: d.type === 'flac' ? 'flac' : 'mp3' };
+  }
+  return null;
+}
+
 function buildDirectBackends(http) {
   /* ---- 聚合后端：搜索 + 无损取链，全平台走同一口子 ---- */
   /* 搜索用哪些 server、取链走哪个 server 是两件事：
@@ -509,7 +735,18 @@ function buildDirectBackends(http) {
           out.push(o);
         };
 
-        /* 路 0：网易云官方搜索。聚合站的 netease 搜索分支返空时，这是唯一能搜到的路。 */
+        /* 路 0：原唱优先。版权曲目在 cloudsearch 里被降权到搜不到，
+         * 但歌手全量歌曲接口不降权 —— 先把真原唱塞进来。 */
+        if (officialFirst) {
+          try {
+            const orig = await neteaseArtistOriginals(http, q, limit);
+            for (const r of orig) push(r);
+          } catch {
+            /* 忽略：不影响后面的常规搜索 */
+          }
+        }
+
+        /* 路 1：网易云官方搜索。聚合站的 netease 搜索分支返空时，这是唯一能搜到的路。 */
         if (officialFirst) {
           try {
             const rows = await neteaseOfficialSearch(http, q, Math.max(10, limit));
@@ -552,7 +789,37 @@ function buildDirectBackends(http) {
       async url(song, quality) {
         const id = song.id;
         const server = song._urlServer || urlServer;
+        const wantLossless = quality === 'lossless' || quality === 'hires';
         const chain = [];
+
+        /* 优先级 -1：网易云解灰（Folia 自带后端）。
+         * 这是**唯一**能拿到版权原唱完整版的路 —— 实测「晴天」原唱 269.75s，
+         * 而聚合站对同一个 id 直接返空（0 字节）。
+         * 它必须与主链**并发**跑，不能串在链前面 await：
+         * 解灰链是「本地后端 → 上游解灰源 → 第三方 CDN」三段，实测 0.9~1.4s，
+         * 串行会让每首歌都白等这一秒。并发时两边各跑各的，最后取更好的那个。
+         * 端口自己探（见 discoverUnblockPort）；探到之前这一步静默跳过。 */
+        const unblockPromise = /^\d+$/.test(String(id))
+          ? (async function () {
+              try {
+                const port = neteaseUnblockPort || (await discoverUnblockPort(http));
+                if (!port) return null;
+                const ub = await neteaseUnblockResolve(http, id);
+                if (!ub) return null;
+                const p = await http.probe(ub.url, { Referer: 'https://music.163.com/' });
+                if (!p || !p.ok) return null;
+                return {
+                  url: ub.url,
+                  kind: p.kind,
+                  via: 'unblock:netease:' + p.kind,
+                  quality: isLosslessKind(p.kind) ? 'lossless' : (quality === 'standard' ? 'standard' : 'high'),
+                  probe: p,
+                };
+              } catch {
+                return null;
+              }
+            })()
+          : Promise.resolve(null);
 
         // 优先级 0：br=740 = 无损档（实测真 FLAC 44.1k/24bit 起）。
         chain.push({ via: 'agg:' + server + ':740', url: meting(server, id, 740, AGG_HOST) });
@@ -575,7 +842,37 @@ function buildDirectBackends(http) {
           url: 'https://music.163.com/song/media/outer/url?id=' + id + '.mp3',
         });
 
-        return resolveChain(http, chain, quality, { Referer: 'https://music.163.com/' });
+        const mainPromise = resolveChain(http, chain, quality, { Referer: 'https://music.163.com/' });
+
+        /* 解灰只等一个短预算：正常 0.9~1.4s 就回，但上游 CDN 挂掉时会拖到 12s 超时。
+         * 给它 3.5s 窗口，超时就先用主链结果；主链也没结果时再回头把它的迟到值捞回来
+         * （同一个 promise，不会多发请求）。 */
+        let ub = null;
+        try {
+          ub = await Promise.race([
+            unblockPromise,
+            new Promise(function (r) { setTimeout(function () { r(null); }, 3500); }),
+          ]);
+        } catch {
+          ub = null;
+        }
+
+        const main = await mainPromise;
+
+        /* 主链没结果时，回头等一次解灰的迟到值。 */
+        if (!main && !ub) {
+          try { ub = await unblockPromise; } catch { ub = null; }
+        }
+
+        /* 取舍规则（顺序即优先级）：
+         *   1. 主链给真无损 → 用主链。绝不用解灰的 320k MP3 换掉真 FLAC
+         *      （实测「起风了」主链 110MB/88200Hz/24bit，解灰只有 10MB MP3）。
+         *   2. 解灰给无损 → 用它（普通歌解灰也常回 FLAC）。
+         *   3. 两边都是有损 → 用解灰：它给的是**原唱**，而聚合链对版权曲
+         *      常常只能回同曲翻唱（实测《晴天》原唱 269s vs 翻唱 112s）。 */
+        if (main && isLosslessKind(main.kind)) return main;
+        if (ub && isLosslessKind(ub.kind)) return ub;
+        return ub || main;
       },
 
       async lyric(song) {
@@ -1729,6 +2026,16 @@ module.exports = function activate(api) {
       if (values.quality) reg.config.quality = normQuality(values.quality);
       if (typeof values.fallback === 'boolean') reg.config.fallback = values.fallback;
       if (typeof values.enabledSources === 'string') reg.config.enabledSources = values.enabledSources;
+      /* 端口仍然接受渲染层上报（某些布局下 client 能看到 electron）。
+       * 但**不依赖它** —— 模组 client 跑在隔离上下文时 window.electron 是 undefined，
+       * 主进程会自己探（discoverUnblockPort）。 */
+      const p = Number(values.unblockPort);
+      if (Number.isInteger(p) && p > 0 && p < 65536 && p !== neteaseUnblockPort) {
+        const first = !neteaseUnblockPort;
+        neteaseUnblockPort = p;
+        if (first) urlCache.clear();
+        api.log.info('网易云解灰已接入（端口 ' + p + '，来自渲染层）');
+      }
       await reg.saveConfig();
     }
     return reg.status();
@@ -1738,6 +2045,52 @@ module.exports = function activate(api) {
   api.rpc.handle('status', whenReady(async function () {
     return reg.status();
   }));
+
+  /* 诊断：解灰端口是否就位、能否真解析出一首歌。会主动探端口。 */
+  api.rpc.handle('unblock.status', async function (probeId) {
+    const id = String(probeId || '186016');
+    const out = { port: neteaseUnblockPort, id: id, steps: [] };
+    if (!neteaseUnblockPort) {
+      const found = await discoverUnblockPort(reg.http, true);
+      out.discovered = found;
+      out.port = neteaseUnblockPort;
+      if (!found) {
+        out.error = '扫描本机临时端口段未找到解灰后端（' +
+          EPHEMERAL_RANGES.map(function (r) { return r[0] + '-' + r[1]; }).join(' / ') + '）';
+        return out;
+      }
+    }
+    const url = unblockUrl(id, 'lossless');
+    out.url = url;
+    let raw = null;
+    try {
+      const r = await reg.http.httpGet(url, { timeout: 12000 });
+      out.steps.push({ step: 'httpGet', status: r.status, bytes: r.buf.length });
+      raw = r.buf.toString('utf8');
+      out.rawHead = raw.slice(0, 300);
+    } catch (err) {
+      out.steps.push({ step: 'httpGet', err: String((err && err.message) || err) });
+      return out;
+    }
+    let j = null;
+    try {
+      j = JSON.parse(raw);
+    } catch (err) {
+      out.steps.push({ step: 'parse', err: String((err && err.message) || err) });
+      return out;
+    }
+    const d = (j && j.data && j.data[0]) || null;
+    out.steps.push({ step: 'shape', code: j && j.code, hasData: !!d, hasUrl: !!(d && d.url) });
+    if (d && d.url) {
+      try {
+        const p = await reg.http.probe(d.url, { Referer: 'https://music.163.com/' });
+        out.probe = p;
+      } catch (err) {
+        out.steps.push({ step: 'probe', err: String((err && err.message) || err) });
+      }
+    }
+    return out;
+  });
 
   // 异步启动，不阻塞宿主
   ready
@@ -1754,6 +2107,15 @@ module.exports = function activate(api) {
           bad.map(function (u) { return u.name + ': ' + u.error; }).join(' | ')
         );
       }
+      /* 启动即探解灰端口：否则第一首歌会在「还没探到」的窗口里退回翻唱。 */
+      discoverUnblockPort(reg.http, true)
+        .then(function (port) {
+          if (port) api.log.info('网易云解灰已接入（端口 ' + port + '）：版权原唱可解析');
+          else api.log.info('未发现网易云解灰后端，版权原唱将退回常规链');
+        })
+        .catch(function () {
+          /* 探测失败不影响其它音源 */
+        });
     })
     .catch(function (err) {
       api.log.error('音源初始化失败', String(err));
